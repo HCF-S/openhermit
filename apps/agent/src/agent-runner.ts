@@ -144,6 +144,21 @@ const addUserIdToList = (existing: string[], userId: string | undefined): string
   return existing.includes(userId) ? existing : [...existing, userId];
 };
 
+/** Default per-turn inactivity watchdog budget (10 min). Far longer than any
+ *  normal model stream gap, so it only trips on a genuinely wedged turn. */
+const DEFAULT_TURN_WATCHDOG_MS = 10 * 60_000;
+
+/**
+ * Parse `OPENHERMIT_TURN_WATCHDOG_MS`. Falls back to the default when unset or
+ * malformed; `0` (or negative) explicitly disables the watchdog.
+ */
+function parseTurnWatchdogMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_TURN_WATCHDOG_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_TURN_WATCHDOG_MS;
+  return Math.floor(parsed);
+}
+
 /**
  * Raised by `runScheduledJob` when a cron firing's turn ended in a model error
  * (`stopReason==='error'`). A model error means the run produced no reply, so
@@ -182,6 +197,18 @@ export class AgentRunner implements SessionRuntime {
 
   private workspaceIdleTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /**
+   * Per-turn inactivity watchdog budget in ms. A turn that emits no agent
+   * event for this long is presumed wedged (a model/tool await that ignores
+   * the abort signal) and gets `agent.abort()`'d so the serial
+   * `session.queue` is released instead of blocking every later message
+   * forever. `0` disables the watchdog. Deliberately generous by default so
+   * a legitimately long tool call (a slow sandbox build emits no events
+   * between `tool_execution_start` and `_end`) is never killed mid-flight;
+   * override with `OPENHERMIT_TURN_WATCHDOG_MS`.
+   */
+  private readonly turnWatchdogMs: number;
+
   private mcpClientManager: McpClientManager | undefined;
 
   private researchOrchestrator: ResearchOrchestrator | undefined;
@@ -207,6 +234,7 @@ export class AgentRunner implements SessionRuntime {
     this.security = options.security;
     this.workspace = options.workspace;
     this.scope = { agentId: options.security.agentId };
+    this.turnWatchdogMs = parseTurnWatchdogMs(process.env.OPENHERMIT_TURN_WATCHDOG_MS);
     this.containerManager =
       options.containerManager
       ?? new DockerContainerManager(options.workspace, {
@@ -223,7 +251,57 @@ export class AgentRunner implements SessionRuntime {
       agentId: runner.scope.agentId,
       at: new Date().toISOString(),
     });
+    // Clear any persisted `running`/`awaiting_approval` rows left behind by a
+    // prior process that died (or was restarted) mid-turn. This runner holds
+    // no in-memory turn for this agent yet — under the single-writer-per-agent
+    // model, an active-status row at hydration time is always stale, and
+    // `listSessions` reads status from the DB row, so without this sweep such
+    // a session would show a phantom `running` forever and its channel would
+    // look wedged. In-memory reopen already lands on `idle`, so this only
+    // fixes sessions not yet reopened.
+    await runner.recoverStaleRunningSessions();
     return runner;
+  }
+
+  /**
+   * Reset persisted sessions stuck in an active status (`running` /
+   * `awaiting_approval`) back to `idle` at hydration. See {@link create} for
+   * why this is safe (single-writer-per-agent: no other process owns these
+   * rows, and this process has not opened them yet).
+   */
+  private async recoverStaleRunningSessions(): Promise<void> {
+    let entries;
+    try {
+      entries = await this.store.sessions.list(this.scope, { includeInactive: true });
+    } catch (error) {
+      // Recovery is best-effort; never let it block agent hydration.
+      this.logRuntime(
+        `stale-session recovery: list failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+    const stale = entries.filter(
+      (e) => e.status === 'running' || e.status === 'awaiting_approval',
+    );
+    if (stale.length === 0) return;
+    let recovered = 0;
+    for (const entry of stale) {
+      try {
+        await this.store.sessions.updateStatus(this.scope, entry.sessionId, 'idle');
+        recovered += 1;
+      } catch (error) {
+        this.logRuntime(
+          `stale-session recovery: reset ${entry.sessionId} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    this.logRuntime(
+      `stale-session recovery: reset ${recovered}/${stale.length} session(s) from active→idle`,
+    );
   }
 
   /**
@@ -1212,6 +1290,55 @@ export class AgentRunner implements SessionRuntime {
     session.idleSummaryTimer = undefined;
   }
 
+  /**
+   * Arm the per-turn inactivity watchdog. Called once at turn start. The
+   * timer is re-armed by {@link bumpTurnWatchdog} on every agent event, so it
+   * only fires after a full `turnWatchdogMs` of complete silence. On fire it
+   * aborts the run: if the wedged await honors the abort signal the turn
+   * settles normally (queue released); if it doesn't, the abort is a no-op
+   * and the turn is logged as unrecoverable-without-restart (see the PR — the
+   * startup sweep makes that restart clean).
+   */
+  private armTurnWatchdog(session: RunnerSession): void {
+    this.clearTurnWatchdog(session);
+    if (this.turnWatchdogMs <= 0) return;
+    session.turnWatchdogTimer = setTimeout(() => {
+      // Single-shot: clear the handle first so the abort-triggered agent_end
+      // (which flows back through bumpTurnWatchdog) cannot re-arm us against an
+      // already-settling turn.
+      session.turnWatchdogTimer = undefined;
+      const idleSec = session.turnStartMs
+        ? Math.round((Date.now() - session.turnStartMs) / 1000)
+        : Math.round(this.turnWatchdogMs / 1000);
+      this.logRuntime(
+        `turn watchdog: no agent activity for ${idleSec}s on session ${session.spec.sessionId} — aborting presumed-wedged turn`,
+      );
+      agentErrorsTotal.inc({ agent_id: this.scope.agentId, source: 'watchdog' });
+      try {
+        session.agent.abort();
+      } catch (error) {
+        this.logRuntime(
+          `turn watchdog: abort threw for ${session.spec.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }, this.turnWatchdogMs);
+  }
+
+  /** Re-arm the watchdog if a turn is currently being watched. No-op between
+   *  turns (timer undefined), so late events never resurrect the timer. */
+  private bumpTurnWatchdog(session: RunnerSession): void {
+    if (!session.turnWatchdogTimer) return;
+    this.armTurnWatchdog(session);
+  }
+
+  private clearTurnWatchdog(session: RunnerSession): void {
+    if (!session.turnWatchdogTimer) return;
+    clearTimeout(session.turnWatchdogTimer);
+    session.turnWatchdogTimer = undefined;
+  }
+
   private scheduleIdleSummary(session: RunnerSession): void {
     this.clearIdleSummaryTimer(session);
     session.idleSummaryTimer = setTimeout(() => {
@@ -1496,6 +1623,11 @@ export class AgentRunner implements SessionRuntime {
           );
         }
         session.turnStartMs = Date.now();
+        // Arm the inactivity watchdog for the whole turn — including the
+        // pre-prompt attachment/config prep below, which has hung in the past
+        // on remote media fetches. Re-armed by every agent event via
+        // bumpTurnWatchdog; cleared in the finally.
+        this.armTurnWatchdog(session);
         const modelInputs = session.agent.state.model?.input;
         const supportsImageInput = Array.isArray(modelInputs)
           ? modelInputs.includes('image')
@@ -1519,6 +1651,8 @@ export class AgentRunner implements SessionRuntime {
           error,
           (runError) => this.handleRunError(session, runError),
         );
+      } finally {
+        this.clearTurnWatchdog(session);
       }
     };
 
@@ -3278,6 +3412,10 @@ export class AgentRunner implements SessionRuntime {
   }
 
   private handleAgentEvent(session: RunnerSession, event: AgentEvent): void {
+    // Any agent activity means the turn is alive — push the watchdog deadline
+    // out. No-op between turns (timer undefined), so a late event from an
+    // already-settled turn can't resurrect the timer.
+    this.bumpTurnWatchdog(session);
     switch (event.type) {
       case 'agent_start': {
         const ts = new Date().toISOString();
