@@ -57,3 +57,19 @@ test('isSessionMessage still rejects an attachment missing type', () => {
   };
   assert.equal(isSessionMessage(msg), false);
 });
+
+test('isSessionMessage accepts a string additionalInstruction', () => {
+  assert.equal(
+    isSessionMessage({ text: 'hi', additionalInstruction: 'You are talking to the owner.' }),
+    true,
+  );
+});
+
+test('isSessionMessage omitting additionalInstruction is fine', () => {
+  assert.equal(isSessionMessage({ text: 'hi' }), true);
+});
+
+test('isSessionMessage rejects a non-string additionalInstruction', () => {
+  assert.equal(isSessionMessage({ text: 'hi', additionalInstruction: 123 }), false);
+  assert.equal(isSessionMessage({ text: 'hi', additionalInstruction: { a: 1 } }), false);
+});

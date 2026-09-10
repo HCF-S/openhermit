@@ -1776,6 +1776,8 @@ export class AgentWsClient {
     text: string;
     messageId?: string;
     metadata?: Record<string, unknown>;
+    /** Per-turn system-prompt steering; see SessionMessage.additionalInstruction. */
+    additionalInstruction?: string;
   }): Promise<{ sessionId: string; messageId?: string }> {
     return this.request('session.message', params) as Promise<{ sessionId: string; messageId?: string }>;
   }

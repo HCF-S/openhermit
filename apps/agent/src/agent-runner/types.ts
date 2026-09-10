@@ -35,6 +35,11 @@ export interface RunnerSession extends SessionDescriptor {
   /** Text of the user message that triggered the in-flight turn. Used to
    *  phrase user-facing error notices in the user's own language. */
   currentTurnUserText?: string;
+  /** Per-turn system-prompt steering supplied on the triggering message
+   *  (`SessionMessage.additionalInstruction`). Appended to the system prompt
+   *  for this turn's LLM call(s) only, then overwritten at the next turn's
+   *  `refreshAgentConfiguration`. Never persisted to session history. */
+  currentTurnAdditionalInstruction?: string | undefined;
   approvalGate: ApprovalGate;
   status: SessionStatus;
   messageCount: number;

@@ -1437,6 +1437,11 @@ export class AgentRunner implements SessionRuntime {
 
     const run = async (): Promise<void> => {
       try {
+        // Per-turn system-prompt steering. Set BEFORE refreshAgentConfiguration
+        // so it lands in the system prompt this turn's LLM calls read, and is
+        // reset every turn (to the new message's value, or undefined). Never
+        // persisted to history, so it doesn't accumulate on stored messages.
+        session.currentTurnAdditionalInstruction = message.additionalInstruction;
         await this.refreshAgentConfiguration(session);
         // Snapshot this turn's roster
         session.turnGroupParticipants = message.participants ?? undefined;
@@ -2630,6 +2635,11 @@ export class AgentRunner implements SessionRuntime {
       ...(session.spec.source.type ? { sessionType: session.spec.source.type } : {}),
       sourceKind: session.spec.source.kind,
       ...(session.spec.customInstruction ? { customInstruction: session.spec.customInstruction } : {}),
+      // Per-turn steering from the triggering message. Appended to the system
+      // prompt for this turn only; rebuilt (and cleared) every turn.
+      ...(session.currentTurnAdditionalInstruction?.trim()
+        ? { extraSystemPrompt: session.currentTurnAdditionalInstruction.trim() }
+        : {}),
     });
     session.agent.state.model = resolveModel(config);
     session.agent.state.systemPrompt = refreshedAgent.state.systemPrompt;

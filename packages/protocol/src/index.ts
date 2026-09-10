@@ -121,6 +121,16 @@ export interface SessionMessage {
    *  the server may inject instead of prompting based on user role. */
   mentioned?: boolean;
   /**
+   * Per-turn steering injected into the system prompt for **this turn's LLM
+   * call(s) only** (the whole tool loop the message drives), then discarded.
+   *
+   * Unlike appending to `text`, it is never written to session history and
+   * never replayed on later turns — so ephemeral context (owner identity,
+   * channel hints, autopilot directives) doesn't accumulate on every stored
+   * user message. Honoured by `postMessage` only; ignored by `appendMessage`.
+   */
+  additionalInstruction?: string;
+  /**
    * Record this entry in session history under the given role instead of
    * the default `'user'`. **Only honoured by `appendMessage`**; rejected
    * on `postMessage` (which always represents a user-driven turn).
@@ -1290,6 +1300,10 @@ export const isSessionMessage = (value: unknown): value is SessionMessage => {
   }
 
   if (value.appendAs !== undefined && value.appendAs !== 'user' && value.appendAs !== 'assistant') {
+    return false;
+  }
+
+  if (value.additionalInstruction !== undefined && typeof value.additionalInstruction !== 'string') {
     return false;
   }
 

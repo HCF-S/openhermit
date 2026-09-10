@@ -370,6 +370,70 @@ test('AgentRunner builds dynamic system prompt based on available tools', async 
   assert.match(capturedSystemPrompt, /ID namespacing/);
 });
 
+test('AgentRunner injects additionalInstruction into the system prompt for that turn only', async (t) => {
+  const { workspace, security } = await createSecurityFixture(t, {
+    secrets: {
+      ANTHROPIC_API_KEY: 'test-anthropic-key',
+    },
+  });
+  await security.load();
+
+  const capturedPrompts: string[] = [];
+  const runner = await AgentRunner.create({
+    workspace,
+    security,
+    streamFn: createSequentialStreamFn([
+      (context) => {
+        capturedPrompts.push(context.systemPrompt ?? '');
+        return createTextResponseStream('one');
+      },
+      (context) => {
+        capturedPrompts.push(context.systemPrompt ?? '');
+        return createTextResponseStream('two');
+      },
+    ]),
+  });
+
+  await runner.openSession({
+    sessionId: 'cli:additional-instruction',
+    source: { kind: 'cli', interactive: true },
+  });
+
+  const marker = 'The person you are talking to is the account owner, Alice.';
+
+  // Turn 1 carries additionalInstruction.
+  await runner.postMessage('cli:additional-instruction', {
+    text: 'hi',
+    additionalInstruction: marker,
+  });
+  await runner.waitForSessionIdle('cli:additional-instruction');
+
+  // Turn 2 carries none.
+  await runner.postMessage('cli:additional-instruction', {
+    text: 'still there?',
+  });
+  await runner.waitForSessionIdle('cli:additional-instruction');
+
+  assert.equal(capturedPrompts.length, 2);
+  // Present on the turn that supplied it...
+  assert.ok(
+    capturedPrompts[0]?.includes(marker),
+    'additionalInstruction should be appended to the system prompt on its own turn',
+  );
+  // ...and gone on the next turn (never persisted, never replayed).
+  assert.ok(
+    !capturedPrompts[1]?.includes(marker),
+    'additionalInstruction must not leak into a later turn',
+  );
+
+  // And it is never written to session history.
+  const entries = await readSessionLog(runner, 'cli:additional-instruction');
+  assert.ok(
+    !entries.some((e) => typeof e.content === 'string' && e.content.includes(marker)),
+    'additionalInstruction must not be persisted to session history',
+  );
+});
+
 test('AgentRunner injects session working memory but not long-term memory', async (t) => {
   const { workspace, security, agentId } = await createSecurityFixture(t, {
     secrets: {
