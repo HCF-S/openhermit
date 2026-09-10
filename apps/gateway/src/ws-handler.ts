@@ -179,6 +179,7 @@ const handleRequest = async (
           ...(p.sender !== undefined ? { sender: p.sender } : {}),
           ...(p.participants !== undefined ? { participants: p.participants } : {}),
           ...(p.metadata !== undefined ? { metadata: p.metadata } : {}),
+          ...(p.additionalInstruction !== undefined ? { additionalInstruction: p.additionalInstruction } : {}),
         };
         if (!isSessionMessage(message)) {
           sendError(ws, id, 'INVALID_PARAMS', 'Invalid message params.');
