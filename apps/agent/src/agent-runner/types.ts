@@ -57,6 +57,13 @@ export interface RunnerSession extends SessionDescriptor {
   resolvedChannelUserId?: string;
   langfuseTurnContext?: LangfuseTurnContext;
   turnStartMs?: number;
+  /** Per-turn inactivity watchdog. Armed at turn start, re-armed on every
+   *  agent event, cleared when the turn settles. If no agent event arrives
+   *  for `turnWatchdogMs`, the turn is presumed wedged (a model/tool await
+   *  that never returns) and the watchdog calls `agent.abort()` to release
+   *  the serial `session.queue`, which a hung turn would otherwise block
+   *  forever. Undefined when no turn is in flight. */
+  turnWatchdogTimer?: ReturnType<typeof setTimeout> | undefined;
   /** Consecutive failed tool results in the current turn. Resets at turn
    *  start and on any successful tool result. The agent aborts the turn
    *  when this reaches `MAX_CONSECUTIVE_TOOL_FAILURES` to prevent the

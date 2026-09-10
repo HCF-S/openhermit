@@ -1754,3 +1754,105 @@ test('AgentRunner emits no mentions when a group reply addresses nobody', async 
   assert.equal(final.text, 'no idea, ask someone else');
   assert.equal(final.mentions, undefined);
 });
+
+test('AgentRunner resets stale persisted running sessions to idle at hydration', async (t) => {
+  const { workspace, security, agentId } = await createSecurityFixture(t, {
+    secrets: {
+      ANTHROPIC_API_KEY: 'test-anthropic-key',
+    },
+  });
+  await security.load();
+
+  // First runner: create and settle a session so a persisted index row exists.
+  const runner = await AgentRunner.create({
+    workspace,
+    security,
+    streamFn: createSequentialStreamFn([
+      () => createTextResponseStream('reply'),
+    ]),
+  });
+  await runner.openSession({
+    sessionId: 'cli:crashed-turn',
+    source: { kind: 'cli', interactive: true },
+  });
+  await runner.postMessage('cli:crashed-turn', { text: 'hello' });
+  await runner.waitForSessionIdle('cli:crashed-turn');
+
+  // Simulate a process that died mid-turn: the persisted row is left as
+  // `running` while no runner holds an in-memory turn for it.
+  const store = await DbInternalStateStore.open();
+  t.after(() => store.close());
+  const scope = { agentId };
+  await store.sessions.updateStatus(scope, 'cli:crashed-turn', 'running');
+  assert.equal((await store.sessions.get(scope, 'cli:crashed-turn'))?.status, 'running');
+
+  // A fresh runner hydration must sweep that stale `running` back to `idle`.
+  const restoredRunner = await AgentRunner.create({
+    workspace,
+    security,
+    streamFn: createSequentialStreamFn([
+      () => createTextResponseStream('reply-2'),
+    ]),
+  });
+  const restored = await restoredRunner.listSessions({ kind: 'cli' });
+  const entry = restored.find((s) => s.sessionId === 'cli:crashed-turn');
+  assert.equal(entry?.status, 'idle');
+  assert.equal((await store.sessions.get(scope, 'cli:crashed-turn'))?.status, 'idle');
+});
+
+test('turn watchdog aborts a wedged turn so the session queue is released', async (t) => {
+  const prev = process.env.OPENHERMIT_TURN_WATCHDOG_MS;
+  process.env.OPENHERMIT_TURN_WATCHDOG_MS = '80';
+  t.after(() => {
+    if (prev === undefined) delete process.env.OPENHERMIT_TURN_WATCHDOG_MS;
+    else process.env.OPENHERMIT_TURN_WATCHDOG_MS = prev;
+  });
+
+  const { workspace, security } = await createSecurityFixture(t, {
+    secrets: {
+      ANTHROPIC_API_KEY: 'test-anthropic-key',
+    },
+  });
+  await security.load();
+
+  let sawAbort = false;
+  // A stream call that never yields — the exact zombie shape a wedged
+  // MiniMax turn produces — but one that honors the abort signal. The
+  // watchdog must trip and abort it, letting the run settle and the queue free.
+  const hangingStreamFn = ((_model: unknown, _ctx: unknown, options: { signal?: AbortSignal }) =>
+    new Promise((_resolve, reject) => {
+      const signal = options?.signal;
+      const onAbort = () => {
+        sawAbort = true;
+        reject(new Error('aborted by watchdog'));
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    })) as unknown as StreamFn;
+
+  const runner = await AgentRunner.create({
+    workspace,
+    security,
+    streamFn: hangingStreamFn,
+  });
+
+  await runner.openSession({
+    sessionId: 'cli:wedged-turn',
+    source: { kind: 'cli', interactive: true },
+  });
+  await runner.postMessage('cli:wedged-turn', { text: 'this turn will hang' });
+
+  // Without the watchdog this would never resolve (the queue is blocked on the
+  // hung run). With it, the abort fires at ~80ms and the run settles.
+  await runner.waitForSessionIdle('cli:wedged-turn');
+
+  assert.equal(sawAbort, true, 'watchdog should have aborted the wedged stream');
+  const sessions = await runner.listSessions({ kind: 'cli' });
+  assert.equal(
+    sessions.find((s) => s.sessionId === 'cli:wedged-turn')?.status,
+    'idle',
+  );
+});
