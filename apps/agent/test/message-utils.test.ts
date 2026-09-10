@@ -16,6 +16,7 @@ import {
   pushReasoningTagDelta,
   flushReasoningTagStream,
   normalizeMessageAlternation,
+  repairToolCallPairing,
   downgradeImagesForTextModel,
 } from '../src/agent-runner/message-utils.js';
 
@@ -346,6 +347,106 @@ describe('normalizeMessageAlternation', () => {
     const input: AgentMessage[] = [user('a'), user('b')] as AgentMessage[];
     const before = JSON.stringify(input);
     normalizeMessageAlternation(input);
+    assert.equal(JSON.stringify(input), before);
+  });
+});
+
+describe('repairToolCallPairing', () => {
+  test('drops a toolResult whose toolCall was compacted away (the 2013 wedge)', () => {
+    // Mirrors Lucky Girl Helen: compaction dropped the assistant(toolCall) but
+    // kept its toolResult, so MiniMax 400s with `tool result's tool id(call_…)`.
+    const orphaned: AgentMessage[] = [
+      user('刚发的帖子'),
+      toolResult('call_gone', 'web_search'),
+      assistantText('看到了'),
+    ] as AgentMessage[];
+    const out = repairToolCallPairing(orphaned);
+    assert.equal(roles(out), 'UA');
+    assert.ok(!out.some((m) => (m as { role: string }).role === 'toolResult'));
+  });
+
+  test('strips a toolCall whose result was dropped, keeping the text', () => {
+    const orphaned: AgentMessage[] = [
+      user('hi'),
+      {
+        ...assistantText('稍等,我查一下'),
+        content: [
+          { type: 'text', text: '稍等,我查一下' },
+          { type: 'toolCall', id: 'call_x', name: 'web_search', arguments: {} },
+        ],
+        stopReason: 'toolUse',
+      } as AssistantMessage,
+    ] as AgentMessage[];
+    const out = repairToolCallPairing(orphaned);
+    assert.equal(out.length, 2);
+    const asst = out[1] as AssistantMessage;
+    assert.deepEqual(asst.content.map((b) => b.type), ['text']);
+    // No toolCall remains, so it must no longer claim a tool-use turn.
+    assert.equal(asst.stopReason, 'stop');
+  });
+
+  test('drops an assistant left empty after its only toolCall is stripped', () => {
+    const orphaned: AgentMessage[] = [
+      user('hi'),
+      assistantCall('call_x', 'web_search'), // result never arrived
+      user('还在吗'),
+    ] as AgentMessage[];
+    const out = repairToolCallPairing(orphaned);
+    assert.equal(roles(out), 'UU');
+    assert.equal(out.length, 2);
+  });
+
+  test('keeps a matched call/result pair untouched', () => {
+    const paired: AgentMessage[] = [
+      user('hi'),
+      assistantCall('call_1', 'web_search'),
+      toolResult('call_1', 'web_search'),
+      assistantText('结果如下'),
+    ] as AgentMessage[];
+    const out = repairToolCallPairing(paired);
+    assert.equal(roles(out), 'UATA');
+    assert.equal(out.length, 4);
+  });
+
+  test('keeps the matched half of a parallel call, strips the orphan half', () => {
+    const mixed: AgentMessage[] = [
+      {
+        ...assistantText(''),
+        content: [
+          { type: 'toolCall', id: 'call_a', name: 'x', arguments: {} },
+          { type: 'toolCall', id: 'call_b', name: 'y', arguments: {} },
+        ],
+        stopReason: 'toolUse',
+      } as AssistantMessage,
+      toolResult('call_a', 'x'), // only A came back; B is orphaned
+    ] as AgentMessage[];
+    const out = repairToolCallPairing(mixed);
+    const asst = out[0] as AssistantMessage;
+    const ids = asst.content
+      .filter((b) => b.type === 'toolCall')
+      .map((b) => (b as { id: string }).id);
+    assert.deepEqual(ids, ['call_a']);
+    assert.equal(asst.stopReason, 'toolUse'); // still a tool-use turn (call_a remains)
+    assert.ok(out.some((m) => (m as { role: string }).role === 'toolResult'));
+  });
+
+  test('is a no-op (same reference) on a clean transcript', () => {
+    const clean: AgentMessage[] = [
+      user('hi'),
+      assistantCall('call_1', 'x'),
+      toolResult('call_1', 'x'),
+      assistantText('done'),
+    ] as AgentMessage[];
+    assert.equal(repairToolCallPairing(clean), clean);
+  });
+
+  test('does not mutate the input messages', () => {
+    const input: AgentMessage[] = [
+      toolResult('call_gone', 'x'),
+      assistantText('hi'),
+    ] as AgentMessage[];
+    const before = JSON.stringify(input);
+    repairToolCallPairing(input);
     assert.equal(JSON.stringify(input), before);
   });
 });

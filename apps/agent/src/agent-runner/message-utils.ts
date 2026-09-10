@@ -6,6 +6,7 @@ import type {
   TextContent,
   ThinkingContent,
   ToolCall,
+  ToolResultMessage,
   UserMessage,
 } from '@mariozechner/pi-ai';
 
@@ -159,6 +160,105 @@ export const normalizeMessageAlternation = (
     i = j;
   }
   return out;
+};
+
+/**
+ * Drop tool-call / tool-result blocks left orphaned by compaction or the
+ * rolling context window.
+ *
+ * The anthropic-messages wire format (MiniMax's `/anthropic` endpoint, and
+ * Anthropic itself) demands strict pairing: every assistant `toolCall` must be
+ * answered by a `toolResult` carrying the same id, and every `toolResult` must
+ * reference a `toolCall` earlier in the transcript. Compaction summarizes and
+ * drops old turns and the rolling window slices the transcript — either can cut
+ * between a toolCall and its toolResult, leaving:
+ *   - an orphaned `toolResult` (its `toolCall` was dropped) — MiniMax 400s with
+ *     `invalid params (2013) … tool result's tool id(call_…)`;
+ *   - an orphaned `toolCall` (its `toolResult` was dropped) — the mirror 400.
+ * Once such an orphan is baked into a long-lived session every following turn
+ * re-sends it and 400s — a self-perpetuating wedge, exactly what hit the Lucky
+ * Girl Helen session (`invalid params (2013)` firing immediately after a
+ * `context_compaction`).
+ *
+ * Repair, in two passes:
+ *   1. Drop `toolResult` messages whose `toolCallId` matches no assistant
+ *      `toolCall`.
+ *   2. Strip `toolCall` blocks whose id has no surviving `toolResult`; drop an
+ *      assistant message this empties, and demote a `toolUse` stopReason to
+ *      `stop` when the last call is removed but text/thinking remains.
+ *
+ * Compaction preserves message order, so a set-based match (a call and its
+ * result are matched wherever they sit) is safe — anything that survives both
+ * passes keeps its original order and therefore its valid pairing.
+ *
+ * REQUEST-ONLY — same contract as `normalizeMessageAlternation`: callers apply
+ * it to the wire payload after the live-state write-back, never to persisted
+ * history, so a session that already baked an orphan in auto-unwedges on its
+ * next turn with no DB surgery. Run it BEFORE `normalizeMessageAlternation` so a
+ * dropped message that leaves two same-role turns adjacent is then coalesced.
+ * Returns the input array unchanged (same reference) when nothing is orphaned.
+ */
+export const repairToolCallPairing = (
+  messages: AgentMessage[],
+): AgentMessage[] => {
+  const isToolResult = (m: AgentMessage): m is ToolResultMessage =>
+    (m as Message).role === 'toolResult';
+  const toolCallsOf = (m: AgentMessage): ToolCall[] =>
+    isAssistantMessage(m)
+      ? (m.content.filter((b) => b.type === 'toolCall') as ToolCall[])
+      : [];
+
+  // Every toolCall id present anywhere in the transcript.
+  const callIds = new Set<string>();
+  for (const m of messages) for (const c of toolCallsOf(m)) callIds.add(c.id);
+
+  let changed = false;
+
+  // Pass 1: drop toolResults whose toolCall was compacted away, and record the
+  // toolCallIds of the results that survive.
+  const resultIds = new Set<string>();
+  const afterResults = messages.filter((m) => {
+    if (!isToolResult(m)) return true;
+    if (!callIds.has(m.toolCallId)) {
+      changed = true;
+      return false;
+    }
+    resultIds.add(m.toolCallId);
+    return true;
+  });
+
+  // Pass 2: strip toolCall blocks whose result didn't survive.
+  const out: AgentMessage[] = [];
+  for (const m of afterResults) {
+    const calls = toolCallsOf(m);
+    if (calls.length === 0 || calls.every((c) => resultIds.has(c.id))) {
+      out.push(m);
+      continue;
+    }
+    changed = true;
+    const orphanIds = new Set(
+      calls.filter((c) => !resultIds.has(c.id)).map((c) => c.id),
+    );
+    const assistant = m as AssistantMessage;
+    const nextContent = assistant.content.filter(
+      (b) => !(b.type === 'toolCall' && orphanIds.has((b as ToolCall).id)),
+    );
+    const hasUsable = nextContent.some(
+      (b) => b.type !== 'text' || ((b as TextContent).text?.trim().length ?? 0) > 0,
+    );
+    // Nothing worth sending once the orphan calls are gone — drop the turn.
+    if (!hasUsable) continue;
+    const stillHasCall = nextContent.some((b) => b.type === 'toolCall');
+    out.push({
+      ...assistant,
+      content: nextContent,
+      ...(assistant.stopReason === 'toolUse' && !stillHasCall
+        ? { stopReason: 'stop' as const }
+        : {}),
+    } as AgentMessage);
+  }
+
+  return changed ? out : messages;
 };
 
 /**
