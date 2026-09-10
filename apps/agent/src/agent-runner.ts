@@ -57,6 +57,7 @@ import {
   isAssistantMessage,
   isEmptyAssistantTurn,
   normalizeMessageAlternation,
+  repairToolCallPairing,
   downgradeImagesForTextModel,
   stripEmptyAssistantTurns,
   stripLeadingSpeakerTag,
@@ -3125,6 +3126,16 @@ export class AgentRunner implements SessionRuntime {
         liveState.push(...core);
       }
     }
+
+    // Wire-shape guard: drop tool-call/tool-result blocks that compaction or the
+    // rolling window left orphaned. The anthropic-messages endpoints (MiniMax's
+    // `/anthropic`) 400 with `invalid params (2013) … tool result's tool id(…)`
+    // when a toolResult references a toolCall no longer in the payload (or a
+    // toolCall lost its result) — a self-perpetuating wedge once baked into a
+    // long-lived session. Runs BEFORE alternation so a message it empties/drops
+    // gets its same-role neighbours coalesced. Request-only, like the guards
+    // below (never touches persisted history).
+    finalMessages = repairToolCallPairing(finalMessages);
 
     // Final wire-shape guard: coalesce any consecutive same-role messages so
     // the transcript strictly alternates user/assistant. Strict providers
